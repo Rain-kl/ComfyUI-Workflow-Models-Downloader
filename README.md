@@ -3,7 +3,7 @@
 [![ComfyUI Registry](https://img.shields.io/badge/ComfyUI-Registry-green)](https://registry.comfy.org/publishers/slahiri/nodes/comfyui-workflow-models-downloader)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![GitHub stars](https://img.shields.io/github/stars/slahiri/ComfyUI-Workflow-Models-Downloader.svg)](https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/Rain-kl/ComfyUI-Workflow-Models-Downloader.svg)](https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader/stargazers)
 
 A powerful ComfyUI extension that automatically detects models in your workflow and helps download missing ones from HuggingFace, CivitAI, and other sources.
 
@@ -93,7 +93,7 @@ Search for "Workflow Models Downloader" in ComfyUI Manager and click Install.
 ### Manual Installation
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader.git
+git clone https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader.git
 pip install -r ComfyUI-Workflow-Models-Downloader/requirements.txt
 ```
 

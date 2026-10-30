@@ -9,6 +9,7 @@ import json
 import logging
 import asyncio
 import datetime
+import random
 import requests
 import threading
 import time
@@ -63,7 +64,7 @@ SETTINGS_FILE = os.path.join(EXTENSION_PATH, 'settings.json')
 
 # Version info
 PYPROJECT_FILE = os.path.join(EXTENSION_PATH, 'pyproject.toml')
-GITHUB_REPO = "slahiri/ComfyUI-Workflow-Models-Downloader"
+GITHUB_REPO = "Rain-kl/ComfyUI-Workflow-Models-Downloader"
 REGISTRY_URL = "https://registry.comfy.org/nodes/comfyui-workflow-models-downloader"
 
 def get_installed_version():
@@ -72,7 +73,7 @@ def get_installed_version():
         logging.debug(f"[WMD] Looking for pyproject.toml at: {PYPROJECT_FILE}")
         if not os.path.exists(PYPROJECT_FILE):
             logging.warning(f"[WMD] pyproject.toml not found at: {PYPROJECT_FILE}")
-            return "1.8.1"  # Fallback to current version
+            return "1.9.0"  # Fallback to current version
 
         with open(PYPROJECT_FILE, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -86,7 +87,7 @@ def get_installed_version():
                 logging.warning(f"[WMD] Could not find version in pyproject.toml")
     except Exception as e:
         logging.error(f"[WMD] Could not read version from pyproject.toml: {e}")
-    return "1.8.1"  # Fallback to current version
+    return "1.9.0"  # Fallback to current version
 
 def get_latest_version():
     """Get latest version from GitHub releases API"""
@@ -133,6 +134,13 @@ download_progress = {}
 download_lock = threading.Lock()
 cancelled_downloads = set()  # Track cancelled download IDs
 
+# Paused downloads. A paused transfer keeps its partial data and segment state,
+# parks its worker threads and resumes from the exact byte offset on demand.
+paused_downloads = set()
+pause_lock = threading.Lock()
+# Queue entries of downloads paused before they could finish; resume re-queues them.
+paused_download_info = {}
+
 # Download history (persistent)
 download_history = []
 
@@ -141,6 +149,19 @@ download_queue = []  # Queued downloads waiting to start
 download_queue_lock = threading.Lock()
 max_parallel_downloads = 3  # Default, configurable via settings
 active_download_count = 0
+
+# Download resilience: resume from partial files, retry transient failures
+DOWNLOAD_MAX_RETRIES = 10           # retries on top of the initial attempt
+DOWNLOAD_RETRY_BASE_DELAY = 2.0     # seconds, doubled on every failed attempt
+DOWNLOAD_RETRY_MAX_DELAY = 60.0     # hard cap on a single wait
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_CONNECT_TIMEOUT = 30
+DOWNLOAD_READ_TIMEOUT = 60
+
+# Segmented (multi-connection) download
+DOWNLOAD_SEGMENTS = 8               # parallel connections per file
+DOWNLOAD_SEGMENT_MIN_SIZE = 4 * 1024 * 1024   # don't split below this per segment
+DOWNLOAD_SEGMENT_STATE_SUFFIX = '.segments.json'
 
 # Model aliases file
 MODEL_ALIASES_FILE = os.path.join(EXTENSION_PATH, 'metadata', 'model-aliases.json')
@@ -165,7 +186,10 @@ def load_settings():
         'civitai_api_key': '',
         'tavily_api_key': '',
         'enable_advanced_search': False,
-        'max_parallel_downloads': 3
+        'max_parallel_downloads': 3,
+        'max_download_retries': DOWNLOAD_MAX_RETRIES,
+        'retry_max_wait_seconds': DOWNLOAD_RETRY_MAX_DELAY,
+        'download_segments': DOWNLOAD_SEGMENTS
     }
 
     # First try extension's own settings file
@@ -2926,10 +2950,77 @@ async def cancel_download(request):
         if download_id in download_progress:
             cancelled_downloads.add(download_id)
             download_progress[download_id]['status'] = 'cancelled'
+            # A cancelled download must not stay parked in the paused set
+            with pause_lock:
+                paused_downloads.discard(download_id)
             logging.info(f"[Workflow-Models-Downloader] Cancelled download: {download_id}")
             return web.json_response({'success': True, 'message': 'Download cancelled'})
         else:
             return web.json_response({'error': 'Download not found'}, status=404)
+
+
+@routes.post("/workflow-models/pause/{download_id}")
+async def pause_download(request):
+    """Pause a running download, keeping its partial data for resume"""
+    download_id = request.match_info['download_id']
+
+    with download_lock:
+        if download_id not in download_progress:
+            return web.json_response({'error': 'Download not found'}, status=404)
+
+        entry = download_progress[download_id]
+        if entry.get('status') in ('completed', 'cancelled', 'error'):
+            return web.json_response(
+                {'error': f"Cannot pause a download that is {entry.get('status')}"}, status=400)
+
+        with pause_lock:
+            paused_downloads.add(download_id)
+
+        entry['status'] = 'paused'
+        entry['retry_in'] = 0
+        logging.info(f"[Workflow-Models-Downloader] Pausing download: {download_id}")
+
+    return web.json_response({
+        'success': True,
+        'message': 'Download paused',
+        'downloaded': download_progress.get(download_id, {}).get('downloaded', 0)
+    })
+
+
+@routes.post("/workflow-models/resume/{download_id}")
+async def resume_download(request):
+    """Resume a paused download from its current byte offset"""
+    download_id = request.match_info['download_id']
+
+    queued_info = None
+    with download_lock:
+        if download_id not in download_progress:
+            return web.json_response({'error': 'Download not found'}, status=404)
+
+        with pause_lock:
+            was_paused = download_id in paused_downloads
+            paused_downloads.discard(download_id)
+
+        if not was_paused:
+            return web.json_response({'error': 'Download is not paused'}, status=400)
+
+        download_progress[download_id]['status'] = 'downloading'
+        download_progress[download_id]['error'] = ''
+        # Queued downloads unwind their worker on pause, so they need to be
+        # scheduled again rather than merely unparked.
+        resume_info = paused_download_info.pop(download_id, None)
+        if resume_info is not None:
+            queued_info = resume_info
+
+    if queued_info is not None:
+        with download_queue_lock:
+            download_queue.append(queued_info)
+        start_download_queue_worker()
+        logging.info(f"[Workflow-Models-Downloader] Re-queued paused download: {download_id}")
+    else:
+        logging.info(f"[Workflow-Models-Downloader] Resumed download: {download_id}")
+
+    return web.json_response({'success': True, 'message': 'Download resumed'})
 
 
 @routes.get("/workflow-models/download-history")
@@ -2970,99 +3061,703 @@ async def delete_history_item_endpoint(request):
         return web.json_response({'error': str(e)}, status=500)
 
 
-def _download_model_thread(download_id, hf_repo, hf_path, filename, target_dir):
-    """Background thread to download a model"""
+# ============================================================================
+# Resilient download core: resume + exponential backoff retry
+# ============================================================================
+
+
+def _get_retry_config():
+    """Read retry limits from settings, falling back to the module defaults."""
     try:
-        from huggingface_hub import hf_hub_download
+        settings = load_settings()
+        max_retries = int(settings.get('max_download_retries', DOWNLOAD_MAX_RETRIES))
+        max_delay = float(settings.get('retry_max_wait_seconds', DOWNLOAD_RETRY_MAX_DELAY))
+        return max(0, max_retries), max(1.0, max_delay)
+    except Exception:
+        return DOWNLOAD_MAX_RETRIES, DOWNLOAD_RETRY_MAX_DELAY
 
-        # Normalize path separators for the OS
-        target_dir_normalized = target_dir.replace('/', os.sep).replace('\\', os.sep)
-        target_path = os.path.join(folder_paths.models_dir, target_dir_normalized)
 
-        # Create directory if it doesn't exist
+def _retry_delay(attempt, max_delay=DOWNLOAD_RETRY_MAX_DELAY):
+    """Exponential backoff with jitter: 2s, 4s, 8s ... never above max_delay."""
+    delay = DOWNLOAD_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1))
+    delay = min(delay, max_delay)
+    jitter = random.uniform(0, min(1.0, delay * 0.1))
+    return round(min(delay + jitter, max_delay), 2)
+
+
+def _sleep_interruptible(seconds, download_id):
+    """Sleep in slices so a cancel request is honoured quickly. Returns True if cancelled."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if download_id in cancelled_downloads:
+            return True
+        _wait_while_paused(download_id)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.5, remaining))
+
+
+def _is_paused(download_id):
+    with pause_lock:
+        return download_id in paused_downloads
+
+
+def _wait_while_paused(download_id):
+    """Block while the download is paused. Returns True if it was cancelled meanwhile."""
+    announced = False
+    while True:
+        if download_id in cancelled_downloads:
+            return True
+        with pause_lock:
+            paused = download_id in paused_downloads
+        if not paused:
+            return False
+        if not announced:
+            logging.info(f"[WMD] Download paused, holding at current offset: {download_id}")
+            announced = True
+        time.sleep(0.2)
+
+
+def _parse_content_range_total(value):
+    """Extract the total size from a `Content-Range: bytes 0-99/1234` header."""
+    match = re.match(r'bytes\s+\d+-\d+/(\d+)', value or '')
+    return int(match.group(1)) if match else 0
+
+
+def _http_error_message(response, url):
+    """Turn an HTTP error response into a message the UI can act on."""
+    status = response.status_code
+    if status in (401, 403):
+        if 'huggingface.co' in url:
+            return (f"Unauthorized (HTTP {status}): HuggingFace token required. Go to File > Settings > "
+                    "Workflow Models Downloader to configure your HuggingFace token. "
+                    "Get one at https://huggingface.co/settings/tokens")
+        if 'civitai.com' in url:
+            return (f"Unauthorized (HTTP {status}): CivitAI API key required. Go to File > Settings > "
+                    "Workflow Models Downloader to configure your CivitAI API key.")
+        return f"Unauthorized (HTTP {status}): Authentication required for this model."
+    if status == 404:
+        return "Model not found (HTTP 404): The file may have been moved or deleted."
+    return f"HTTP {status}: {response.reason}"
+
+
+def _set_progress(download_id, **fields):
+    """Update a progress entry if it still exists."""
+    with download_lock:
+        entry = download_progress.get(download_id)
+        if entry is not None:
+            entry.update(fields)
+
+
+def _resolve_target_dir(target_dir):
+    """Map a models subdirectory name to an absolute path, creating it."""
+    normalized = target_dir.replace('/', os.sep).replace('\\', os.sep)
+    target_path = os.path.join(folder_paths.models_dir, normalized)
+    os.makedirs(target_path, exist_ok=True)
+    logging.info(f"[Workflow-Models-Downloader] Target directory: {target_path}")
+    return target_path
+
+
+def _resolve_dest_file(target_path, filename):
+    """Resolve the final file path, creating any subdirectories in the name."""
+    normalized = filename.replace('/', os.sep).replace('\\', os.sep)
+    dest_file = os.path.join(target_path, normalized)
+    parent = os.path.dirname(dest_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return dest_file
+
+
+def _mark_download_error(download_id, filename, target_dir, error):
+    """Record a failed download in progress + history."""
+    _set_progress(download_id, status='error', error=error, retry_in=0)
+    add_to_download_history({
+        'id': download_id,
+        'filename': filename,
+        'status': 'error',
+        'error': error,
+        'directory': target_dir
+    })
+
+
+def _mark_download_cancelled(download_id, filename):
+    """Record a user-cancelled download. Any .partial file is kept for resume."""
+    logging.info(f"[Workflow-Models-Downloader] Download cancelled: {filename}")
+    _set_progress(download_id, status='cancelled', retry_in=0)
+
+
+def _mark_download_paused(download_id, filename):
+    """Record a user-paused download.
+
+    The partial file and per-segment state are intentionally kept so that
+    resuming continues from the current byte offset instead of restarting.
+    """
+    downloaded = download_progress.get(download_id, {}).get('downloaded', 0)
+    logging.info(f"[Workflow-Models-Downloader] Download paused at {downloaded} bytes: {filename}")
+    _set_progress(download_id, status='paused', retry_in=0, retry_attempt=0)
+
+
+def _finish_download_result(ok, error, download_id, filename, target_dir):
+    """Map a download outcome onto progress state. Returns True when it completed."""
+    if ok:
+        return True
+    if error == 'Cancelled':
+        _mark_download_cancelled(download_id, filename)
+    elif error == 'Paused':
+        _mark_download_paused(download_id, filename)
+    else:
+        _mark_download_error(download_id, filename, target_dir, error)
+    return False
+
+
+def _get_segment_config():
+    """Parallel connection count for segmented downloads (1 disables it).
+
+    Segments write concurrently to disjoint offsets in one file, which is only
+    safe where positional writes exist. Elsewhere we stay single-stream rather
+    than risk interleaved writes.
+    """
+    if not hasattr(os, 'pwrite'):
+        return 1
+    try:
+        settings = load_settings()
+        segments = int(settings.get('download_segments', DOWNLOAD_SEGMENTS))
+    except Exception:
+        segments = DOWNLOAD_SEGMENTS
+    return max(1, min(16, segments))
+
+
+def _probe_segment_support(url, headers):
+    """Return total size if the server supports ranged requests, else 0.
+
+    A ranged probe keeps the cost tiny; servers that answer 200 instead of 206
+    (or omit Accept-Ranges) are not segmentable and fall back to streaming.
+    """
+    probe_headers = dict(headers) if headers else {}
+    probe_headers['Range'] = 'bytes=0-0'
+    try:
+        with requests.get(url, headers=probe_headers, stream=True, allow_redirects=True,
+                          timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
+            if response.status_code == 206:
+                total = _parse_content_range_total(response.headers.get('content-range'))
+                if total > 0:
+                    return total
+                content_range = response.headers.get('content-range', '')
+                match = re.search(r'/(\d+)\s*$', content_range)
+                if match:
+                    return int(match.group(1))
+            elif response.status_code == 200:
+                return 0  # No range support
+    except requests.exceptions.RequestException as exc:
+        logging.debug(f"[WMD] Segment probe failed: {exc}")
+    return 0
+
+
+def _pwrite(fd, data, offset):
+    """Positional write, with a portable fallback for platforms without pwrite."""
+    if hasattr(os, 'pwrite'):
+        return os.pwrite(fd, data, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.write(fd, data)
+
+
+def _load_segment_state(state_path):
+    """Load the per-segment progress map, discarding anything unreadable."""
+    try:
+        with open(state_path, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        if isinstance(state, dict) and isinstance(state.get('segments'), list):
+            return state
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_segment_state(state_path, state):
+    """Persist segment progress so a restarted download resumes where it stopped."""
+    try:
+        tmp = state_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+        os.replace(tmp, state_path)
+    except OSError as exc:
+        logging.debug(f"[WMD] Could not persist segment state: {exc}")
+
+
+def _segment_worker(url, fd, segment, headers, download_id, counters, error_box, state, state_path, lock):
+    """Download one byte range, persisting progress and retrying individually.
+
+    Writes land at their absolute offset via pwrite, so segments never share a
+    file cursor and an interrupted run can be resumed byte-for-byte.
+    """
+    start = segment['start']
+    end = segment['end']
+    position = start + segment.get('done', 0)
+
+    attempts_used = 0
+    while position <= end:
+        if download_id in cancelled_downloads:
+            return
+        if _wait_while_paused(download_id):
+            return
+
+        request_headers = dict(headers) if headers else {}
+        request_headers['Range'] = f'bytes={position}-{end}'
+        before = position
+
         try:
-            os.makedirs(target_path, exist_ok=True)
-            logging.info(f"[Workflow-Models-Downloader] Target directory: {target_path}")
-        except Exception as dir_error:
-            logging.error(f"[Workflow-Models-Downloader] Failed to create directory {target_path}: {dir_error}")
-            raise
+            with requests.get(url, headers=request_headers, stream=True, allow_redirects=True,
+                              timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
+                if response.status_code not in (200, 206):
+                    raise requests.exceptions.HTTPError(
+                        _http_error_message(response, url), response=response)
 
-        with download_lock:
-            download_progress[download_id]['status'] = 'downloading'
+                # A 200 means the server ignored the range; treat the body as
+                # starting at this segment's offset only if it actually is.
+                seek_offset = 0
+                if response.status_code == 206:
+                    content_range = response.headers.get('content-range', '')
+                    match = re.match(r'bytes\s+(\d+)-\d+/', content_range)
+                    if match and int(match.group(1)) != position:
+                        raise ValueError(
+                            f'Server returned range starting at {match.group(1)}, expected {position}')
+                else:
+                    # Whole file from byte 0: skip forward to our offset
+                    seek_offset = position
 
-        # Get HuggingFace token if available
-        hf_token = get_huggingface_token()
+                skipped = 0
+                snapshot = counters['downloaded']
+                paused = False
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if download_id in cancelled_downloads:
+                        return
+                    if _is_paused(download_id):
+                        # Drop the connection and re-request from this offset on
+                        # resume; holding the socket open would keep the server
+                        # pushing data we cannot write.
+                        paused = True
+                        break
+                    if not chunk:
+                        continue
+                    if skipped < seek_offset:
+                        to_skip = min(len(chunk), seek_offset - skipped)
+                        skipped += to_skip
+                        chunk = chunk[to_skip:]
+                        if not chunk:
+                            continue
+                    limit = end - position + 1
+                    if len(chunk) > limit:
+                        chunk = chunk[:limit]
+                    _pwrite(fd, chunk, position)
+                    position += len(chunk)
+                    with lock:
+                        counters['downloaded'] += len(chunk)
+                        segment['done'] = position - start
+                        snapshot = counters['downloaded']
+
+                with lock:
+                    _save_segment_state(state_path, state)
+                    _set_progress(download_id, downloaded=snapshot)
+
+                if paused:
+                    continue  # Outer loop waits for the resume signal, then re-ranges
+
+                if position <= end:
+                    raise IOError(f'Segment ended early at {position}, expected through {end}')
+
+                return
+
+        except Exception as exc:
+            if download_id in cancelled_downloads:
+                return
+
+            with lock:
+                segment['done'] = position - start
+                _save_segment_state(state_path, state)
+
+            attempts_used += 1
+            max_retries, max_delay = _get_retry_config()
+            if attempts_used > max_retries:
+                error_box.append(str(exc) or type(exc).__name__)
+                return
+
+            if position == before and attempts_used > 1:
+                # Nothing moved: back off so we don't hammer a dead endpoint
+                delay = _retry_delay(attempts_used, max_delay)
+            else:
+                delay = _retry_delay(1, max_delay)
+
+            logging.warning(
+                f"[WMD] segment {start}-{end}: attempt {attempts_used}/{max_retries + 1} "
+                f"failed ({exc}); retrying in {delay}s from byte {position}"
+            )
+            if _sleep_interruptible(delay, download_id):
+                return
+
+    if position > end:
+        with lock:
+            _save_segment_state(state_path, state)
+
+
+def _download_segmented(url, dest_path, download_id, headers, total_size, force=False):
+    """Download `total_size` bytes over several parallel ranged connections.
+
+    Returns (ok, error_message), or None when segmentation is not worthwhile.
+    Progress is tracked per segment and written to a state file, so an
+    interrupted run resumes from where each segment stopped rather than
+    restarting the whole file. `force` skips the segment-count check so an
+    interrupted run can always be resumed.
+    """
+    partial_path = dest_path + '.partial'
+    state_path = partial_path + DOWNLOAD_SEGMENT_STATE_SUFFIX
+
+    segments = _get_segment_config() if not force else max(2, _get_segment_config())
+    # Never create segments smaller than the floor
+    while segments > 1 and total_size / segments < DOWNLOAD_SEGMENT_MIN_SIZE:
+        segments -= 1
+
+    if segments <= 1 and not force:
+        return None  # Signal: not worth segmenting, use the streaming path
+
+    state = _load_segment_state(state_path)
+    if state and state.get('total_size') != total_size:
+        logging.info("[WMD] Segment state does not match the remote size; restarting segmentation")
+        state = None
+
+    if state is None:
+        span = total_size // segments
+        plan = []
+        for index in range(segments):
+            start = index * span
+            end = total_size - 1 if index == segments - 1 else (index + 1) * span - 1
+            plan.append({'start': start, 'end': end, 'done': 0})
+
+        # Reuse bytes already on disk. A single stream writes a contiguous
+        # prefix, so that prefix can be credited to consecutive segments; a file
+        # that is already full size is a stale preallocation with no usable
+        # progress and has to be discarded.
+        if os.path.exists(partial_path):
+            existing = os.path.getsize(partial_path)
+            if 0 < existing < total_size:
+                remaining = existing
+                for segment in plan:
+                    length = segment['end'] - segment['start'] + 1
+                    take = min(remaining, length)
+                    segment['done'] = take
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                logging.info(f"[WMD] Adopted {existing} existing bytes into segmented plan")
+            elif existing >= total_size:
+                logging.info("[WMD] Discarding a stale preallocated partial file")
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    pass
+
+        state = {'total_size': total_size, 'segments': plan}
+        _save_segment_state(state_path, state)
+    else:
+        logging.info(f"[WMD] Resuming segmented download with {len(state['segments'])} segments")
+
+    if os.path.exists(partial_path):
+        with open(partial_path, 'rb+') as handle:
+            handle.truncate(total_size)
+    else:
+        with open(partial_path, 'wb') as handle:
+            handle.truncate(total_size)
+
+    fd = os.open(partial_path, os.O_WRONLY)
+    lock = threading.Lock()
+    counters = {'downloaded': sum(s.get('done', 0) for s in state['segments'])}
+    error_box = []
+
+    _set_progress(download_id, status='downloading', method='segmented',
+                  total_size=total_size, downloaded=counters['downloaded'],
+                  retry_in=0, progress=min(99, int(counters['downloaded'] * 100 / total_size)))
+
+    def report():
+        while threads_running:
+            with lock:
+                done = counters['downloaded']
+            _set_progress(download_id, downloaded=done,
+                          progress=min(99, int(done * 100 / total_size)))
+            time.sleep(1)
+
+    threads = []
+    threads_running = True
+    for segment in state['segments']:
+        if segment['start'] + segment.get('done', 0) > segment['end']:
+            continue  # Already complete
+        thread = threading.Thread(
+            target=_segment_worker,
+            args=(url, fd, segment, headers, download_id, counters, error_box, state, state_path, lock),
+            daemon=True
+        )
+        threads.append(thread)
+        thread.start()
+
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+
+    try:
+        for thread in threads:
+            while thread.is_alive():
+                thread.join(timeout=0.5)
+    finally:
+        threads_running = False
+
+    os.close(fd)
+
+    if download_id in cancelled_downloads:
+        return False, 'Cancelled'
+
+    with lock:
+        done = counters['downloaded']
+
+    if error_box:
+        return False, error_box[0]
+
+    if done < total_size:
+        if _is_paused(download_id):
+            # Keep the partial and segment state; resuming continues in place.
+            return False, 'Paused'
+        return False, f'Incomplete segmented transfer ({done} of {total_size} bytes)'
+
+    _set_progress(download_id, downloaded=total_size, progress=100)
+    os.replace(partial_path, dest_path)
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+    return True, None
+
+
+def _download_attempt(url, dest_path, partial_path, download_id, headers):
+    """Run one resumable transfer attempt.
+
+    Returns (ok, error_message, retryable). Data is written to `partial_path`
+    and only moved onto `dest_path` once the full payload has arrived, so an
+    interrupted transfer never leaves a truncated file under the real name.
+    """
+    resume_byte = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
+
+    request_headers = dict(headers) if headers else {}
+    if resume_byte > 0:
+        request_headers['Range'] = f'bytes={resume_byte}-'
+
+    with requests.get(
+        url,
+        stream=True,
+        allow_redirects=True,
+        headers=request_headers,
+        timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT),
+    ) as response:
+        if response.status_code == 416 and resume_byte > 0:
+            # Range not satisfiable: the partial file either already covers the
+            # whole payload, or it is stale and has to be discarded.
+            if _parse_content_range_total(response.headers.get('content-range')) == resume_byte:
+                os.replace(partial_path, dest_path)
+                return True, None, False
+            try:
+                os.remove(partial_path)
+            except OSError:
+                pass
+            return False, f'Server rejected resume at byte {resume_byte}; restarting', True
+
+        if response.status_code >= 400:
+            retryable = response.status_code >= 500 or response.status_code in (408, 425, 429)
+            return False, _http_error_message(response, url), retryable
+
+        if resume_byte > 0 and response.status_code != 206:
+            logging.warning(f"[WMD] Server ignored the Range header; restarting from byte 0")
+            resume_byte = 0
+
+        content_length = int(response.headers.get('content-length') or 0)
+        total_size = _parse_content_range_total(response.headers.get('content-range'))
+        if not total_size and content_length:
+            total_size = resume_byte + content_length
+
+        downloaded = resume_byte
+        _set_progress(download_id,
+                      status='downloading',
+                      total_size=total_size,
+                      downloaded=downloaded,
+                      resuming_from=resume_byte,
+                      retry_attempt=0,
+                      retry_in=0)
+
+        with open(partial_path, 'ab' if resume_byte > 0 else 'wb') as handle:
+            for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                if download_id in cancelled_downloads:
+                    return False, 'Cancelled', False
+                if _is_paused(download_id):
+                    # Leave the partial file as-is; resuming re-requests the
+                    # remainder with a Range header from this offset.
+                    _set_progress(download_id, downloaded=downloaded, retry_in=0)
+                    return False, 'Paused', False
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+                _set_progress(download_id, downloaded=downloaded)
+                if total_size > 0:
+                    _set_progress(download_id, progress=min(99, int(downloaded * 100 / total_size)))
+
+    if total_size > 0 and downloaded < total_size:
+        return False, f'Incomplete transfer ({downloaded} of {total_size} bytes)', True
+
+    os.replace(partial_path, dest_path)
+    return True, None, False
+
+
+def _download_with_resume(url, dest_path, download_id, headers=None, display_name=None):
+    """Download `url` to `dest_path`, surviving dropped connections.
+
+    Large files on a ranged-capable server are fetched over several parallel
+    connections (segmented); anything else falls back to a single resumable
+    stream. Transient failures are retried with exponential backoff up to
+    `max_download_retries` times (capped at `retry_max_wait_seconds`).
+    Returns (ok, error_message).
+    """
+    os.makedirs(os.path.dirname(dest_path) or '.', exist_ok=True)
+    partial_path = dest_path + '.partial'
+    display_name = display_name or os.path.basename(dest_path)
+
+    max_retries, max_delay = _get_retry_config()
+    total_attempts = max_retries + 1
+    last_error = 'Unknown error'
+    state_path = partial_path + DOWNLOAD_SEGMENT_STATE_SUFFIX
+
+    # A segmented run preallocates the partial to the full size and tracks
+    # progress per segment. The single-stream path would read that file's size
+    # as "already complete", so it must never take over a partial that has
+    # segment state. Force segmentation instead, even if it is now disabled.
+    if os.path.exists(state_path):
+        forced_size = _probe_segment_support(url, headers)
+        if forced_size > 0:
+            logging.info(f"[WMD] {display_name}: resuming an interrupted segmented download")
+            try:
+                result = _download_segmented(url, dest_path, download_id, headers,
+                                             forced_size, force=True)
+            except Exception as exc:
+                result = (False, f'{type(exc).__name__}: {exc}')
+            if result is not None:
+                ok, error = result
+                if ok:
+                    return True, None
+                if error in ('Cancelled', 'Paused'):
+                    return False, error
+                return False, error
+
+    # Try the segmented path first when the server supports ranges.
+    if _get_segment_config() > 1:
+        total_size = _probe_segment_support(url, headers)
+        if total_size > 0:
+            try:
+                result = _download_segmented(url, dest_path, download_id, headers, total_size)
+            except Exception as exc:
+                result = (False, f'{type(exc).__name__}: {exc}')
+
+            if result is not None:
+                ok, error = result
+                if ok:
+                    return True, None
+                if error in ('Cancelled', 'Paused'):
+                    return False, error
+
+                # The segmented run preallocates the partial to the full size and
+                # keeps its own per-segment state. Falling back to a single stream
+                # here would misread that file as already complete, so report the
+                # failure and let a retry resume the same segments.
+                logging.warning(f"[WMD] {display_name}: segmented download did not complete ({error}); "
+                                "progress is kept for the next attempt")
+                return False, error
+
+    attempt = 0
+    while attempt < total_attempts:
+        attempt += 1
+        if download_id in cancelled_downloads:
+            return False, 'Cancelled'
+
+        try:
+            ok, error, retryable = _download_attempt(url, dest_path, partial_path, download_id, headers)
+        except requests.exceptions.RequestException as exc:
+            ok, error, retryable = False, f'{type(exc).__name__}: {exc}', True
+        except OSError as exc:
+            ok, error, retryable = False, f'Local file error: {exc}', False
+        except Exception as exc:
+            ok, error, retryable = False, f'{type(exc).__name__}: {exc}', False
+
+        if ok:
+            return True, None
+
+        if error == 'Cancelled':
+            return False, 'Cancelled'
+
+        if error == 'Paused':
+            # Hold here until resumed; the next iteration re-requests the
+            # remainder from the partial file's current size, and a pause must
+            # not count as a retry attempt.
+            if _wait_while_paused(download_id):
+                return False, 'Cancelled'
+            attempt -= 1
+            continue
+
+        last_error = error
+
+        if not retryable:
+            logging.error(f"[WMD] {display_name}: download failed and will not be retried: {error}")
+            return False, error
+
+        if attempt >= total_attempts:
+            last_error = f'{error} -- gave up after {attempt} attempts'
+            break
+
+        delay = _retry_delay(attempt, max_delay)
+        resume_at = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
+        logging.warning(
+            f"[WMD] {display_name}: attempt {attempt}/{total_attempts} failed ({error}); "
+            f"retrying in {delay}s" + (f" from byte {resume_at}" if resume_at else "")
+        )
+        _set_progress(download_id,
+                      retry_attempt=attempt,
+                      retry_max=max_retries,
+                      retry_in=delay,
+                      retry_error=error)
+
+        if _sleep_interruptible(delay, download_id):
+            return False, 'Cancelled'
+        _set_progress(download_id, retry_in=0)
+
+    logging.error(f"[WMD] {display_name}: giving up after backoff retries: {last_error}")
+    return False, last_error
+
+
+def _download_model_thread(download_id, hf_repo, hf_path, filename, target_dir):
+    """Background thread to download a model from HuggingFace"""
+    url = f"https://huggingface.co/{hf_repo}/resolve/main/{hf_path}"
+    try:
+        target_path = _resolve_target_dir(target_dir)
+        dest_file = _resolve_dest_file(target_path, filename)
+
         headers = {}
+        hf_token = get_huggingface_token()
         if hf_token:
             headers['Authorization'] = f'Bearer {hf_token}'
 
-        # Get file size first
-        try:
-            url = f"https://huggingface.co/{hf_repo}/resolve/main/{hf_path}"
-            response = requests.head(url, allow_redirects=True, timeout=10, headers=headers)
-            total_size = int(response.headers.get('content-length', 0))
-            with download_lock:
-                download_progress[download_id]['total_size'] = total_size
-        except Exception:
-            total_size = 0
-
-        # Download with progress callback
-        def progress_callback(downloaded, total):
-            with download_lock:
-                download_progress[download_id]['downloaded'] = downloaded
-                download_progress[download_id]['total_size'] = total
-                if total > 0:
-                    download_progress[download_id]['progress'] = int((downloaded / total) * 100)
-
-        # Use requests for download with progress
-        url = f"https://huggingface.co/{hf_repo}/resolve/main/{hf_path}"
-        # Normalize filename path separators and create subdirectories if needed
-        filename_normalized = filename.replace('/', os.sep).replace('\\', os.sep)
-        dest_file = os.path.join(target_path, filename_normalized)
-        # Create parent directory if filename contains subdirectories
-        dest_dir = os.path.dirname(dest_file)
-        if dest_dir and not os.path.exists(dest_dir):
-            os.makedirs(dest_dir, exist_ok=True)
-
-        response = requests.get(url, stream=True, timeout=30, headers=headers)
-        response.raise_for_status()
-
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        cancelled = False
-
-        with open(dest_file, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks for faster downloads
-                # Check for cancellation
-                if download_id in cancelled_downloads:
-                    logging.info(f"[Workflow-Models-Downloader] Download cancelled: {filename}")
-                    cancelled = True
-                    break
-
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    progress_callback(downloaded, total_size)
-
-        # Handle cancellation after file is properly closed
-        if cancelled:
-            try:
-                os.remove(dest_file)
-            except OSError:
-                pass
-            cancelled_downloads.discard(download_id)
+        ok, error = _download_with_resume(url, dest_file, download_id, headers, display_name=filename)
+        if not _finish_download_result(ok, error, download_id, filename, target_dir):
             return
 
-        with download_lock:
-            download_progress[download_id]['status'] = 'completed'
-            download_progress[download_id]['progress'] = 100
+        _set_progress(download_id, status='completed', progress=100, retry_in=0)
 
         # Save to model_metadata.json (single source of truth)
-        hf_url = f"https://huggingface.co/{hf_repo}/resolve/main/{hf_path}"
         metadata = load_model_metadata()
         metadata[filename] = {
             'filename': filename,
-            'url': hf_url,
+            'url': url,
             'url_source': 'download',
             'source': 'huggingface',
             'hf_repo': hf_repo,
@@ -3079,79 +3774,26 @@ def _download_model_thread(download_id, hf_repo, hf_path, filename, target_dir):
             'status': 'completed',
             'total_size': download_progress.get(download_id, {}).get('total_size', 0),
             'directory': target_dir,
-            'url': hf_url,
+            'url': url,
             'hf_repo': hf_repo,
             'hf_path': hf_path
         })
 
         logging.info(f"[Workflow-Models-Downloader] Downloaded: {filename}")
 
-    except requests.exceptions.HTTPError as e:
-        error_msg = str(e)
-        if e.response is not None:
-            status_code = e.response.status_code
-            if status_code in [401, 403]:
-                if 'huggingface.co' in url:
-                    error_msg = f"Unauthorized (HTTP {status_code}): HuggingFace token required. Go to File > Settings > Workflow Models Downloader to configure your HuggingFace token. Get one at https://huggingface.co/settings/tokens"
-                else:
-                    error_msg = f"Unauthorized (HTTP {status_code}): Authentication required for this model."
-            elif status_code == 404:
-                error_msg = f"Model not found (HTTP 404): The file may have been moved or deleted."
-        logging.error(f"[Workflow-Models-Downloader] Download error: {error_msg}")
-        with download_lock:
-            download_progress[download_id]['status'] = 'error'
-            download_progress[download_id]['error'] = error_msg
-        # Add to download history
-        add_to_download_history({
-            'id': download_id,
-            'filename': filename,
-            'status': 'error',
-            'error': error_msg,
-            'directory': target_dir
-        })
     except Exception as e:
-        logging.error(f"[Workflow-Models-Downloader] Download error: {e}")
-        with download_lock:
-            download_progress[download_id]['status'] = 'error'
-            download_progress[download_id]['error'] = str(e)
-        # Add to download history
-        add_to_download_history({
-            'id': download_id,
-            'filename': filename,
-            'status': 'error',
-            'error': str(e),
-            'directory': target_dir
-        })
+        logging.error(f"[Workflow-Models-Downloader] Download error: {e}", exc_info=True)
+        _mark_download_error(download_id, filename, target_dir, str(e))
     finally:
         # Clean up cancelled flag
         cancelled_downloads.discard(download_id)
 
 
 def _download_from_url_thread(download_id, url, filename, target_dir):
-    """Background thread to download a model from direct URL"""
+    """Background thread to download a model from a direct URL"""
     try:
-        # Normalize path separators for the OS
-        target_dir_normalized = target_dir.replace('/', os.sep).replace('\\', os.sep)
-        target_path = os.path.join(folder_paths.models_dir, target_dir_normalized)
-
-        # Create directory if it doesn't exist
-        try:
-            os.makedirs(target_path, exist_ok=True)
-            logging.info(f"[Workflow-Models-Downloader] Target directory: {target_path}")
-        except Exception as dir_error:
-            logging.error(f"[Workflow-Models-Downloader] Failed to create directory {target_path}: {dir_error}")
-            raise
-
-        with download_lock:
-            download_progress[download_id]['status'] = 'downloading'
-
-        # Normalize filename path separators and create subdirectories if needed
-        filename_normalized = filename.replace('/', os.sep).replace('\\', os.sep)
-        dest_file = os.path.join(target_path, filename_normalized)
-        # Create parent directory if filename contains subdirectories
-        dest_dir = os.path.dirname(dest_file)
-        if dest_dir and not os.path.exists(dest_dir):
-            os.makedirs(dest_dir, exist_ok=True)
+        target_path = _resolve_target_dir(target_dir)
+        dest_file = _resolve_dest_file(target_path, filename)
 
         # Prepare headers based on URL source
         headers = {}
@@ -3172,45 +3814,11 @@ def _download_from_url_thread(download_id, url, filename, target_dir):
             if hf_token:
                 headers['Authorization'] = f'Bearer {hf_token}'
 
-        # Download with progress
-        response = requests.get(url, stream=True, timeout=30, allow_redirects=True, headers=headers)
-        response.raise_for_status()
-
-        total_size = int(response.headers.get('content-length', 0))
-        downloaded = 0
-        cancelled = False
-
-        with download_lock:
-            download_progress[download_id]['total_size'] = total_size
-
-        with open(dest_file, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks for faster downloads
-                # Check for cancellation
-                if download_id in cancelled_downloads:
-                    logging.info(f"[Workflow-Models-Downloader] Download cancelled: {filename}")
-                    cancelled = True
-                    break
-
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    with download_lock:
-                        download_progress[download_id]['downloaded'] = downloaded
-                        if total_size > 0:
-                            download_progress[download_id]['progress'] = int((downloaded / total_size) * 100)
-
-        # Handle cancellation after file is properly closed
-        if cancelled:
-            try:
-                os.remove(dest_file)
-            except OSError:
-                pass
-            cancelled_downloads.discard(download_id)
+        ok, error = _download_with_resume(url, dest_file, download_id, headers, display_name=filename)
+        if not _finish_download_result(ok, error, download_id, filename, target_dir):
             return
 
-        with download_lock:
-            download_progress[download_id]['status'] = 'completed'
-            download_progress[download_id]['progress'] = 100
+        _set_progress(download_id, status='completed', progress=100, retry_in=0)
 
         # Save to model_metadata.json (single source of truth)
         clean_url = url.split('?')[0] if 'civitai.com' in url else url
@@ -3250,44 +3858,9 @@ def _download_from_url_thread(download_id, url, filename, target_dir):
 
         logging.info(f"[Workflow-Models-Downloader] Downloaded from URL: {filename}")
 
-    except requests.exceptions.HTTPError as e:
-        error_msg = str(e)
-        if e.response is not None:
-            status_code = e.response.status_code
-            if status_code in [401, 403]:
-                if 'huggingface.co' in url:
-                    error_msg = f"Unauthorized (HTTP {status_code}): HuggingFace token required. Go to File > Settings > Workflow Models Downloader to configure your HuggingFace token. Get one at https://huggingface.co/settings/tokens"
-                elif 'civitai.com' in url:
-                    error_msg = f"Unauthorized (HTTP {status_code}): CivitAI API key required. Go to File > Settings > Workflow Models Downloader to configure your CivitAI API key."
-                else:
-                    error_msg = f"Unauthorized (HTTP {status_code}): Authentication required for this model."
-            elif status_code == 404:
-                error_msg = f"Model not found (HTTP 404): The file may have been moved or deleted."
-        logging.error(f"[Workflow-Models-Downloader] URL download error: {error_msg}")
-        with download_lock:
-            download_progress[download_id]['status'] = 'error'
-            download_progress[download_id]['error'] = error_msg
-        # Add to download history
-        add_to_download_history({
-            'id': download_id,
-            'filename': filename,
-            'status': 'error',
-            'error': error_msg,
-            'directory': target_dir
-        })
     except Exception as e:
-        logging.error(f"[Workflow-Models-Downloader] URL download error: {e}")
-        with download_lock:
-            download_progress[download_id]['status'] = 'error'
-            download_progress[download_id]['error'] = str(e)
-        # Add to download history
-        add_to_download_history({
-            'id': download_id,
-            'filename': filename,
-            'status': 'error',
-            'error': str(e),
-            'directory': target_dir
-        })
+        logging.error(f"[Workflow-Models-Downloader] URL download error: {e}", exc_info=True)
+        _mark_download_error(download_id, filename, target_dir, str(e))
     finally:
         # Clean up cancelled flag
         cancelled_downloads.discard(download_id)
@@ -3370,6 +3943,27 @@ async def update_settings(request):
                 # Update the global variable too
                 global max_parallel_downloads
                 max_parallel_downloads = current['max_parallel_downloads']
+            except (ValueError, TypeError):
+                pass
+
+        if 'max_download_retries' in data:
+            try:
+                val = int(data['max_download_retries'])
+                current['max_download_retries'] = max(0, min(50, val))
+            except (ValueError, TypeError):
+                pass
+
+        if 'retry_max_wait_seconds' in data:
+            try:
+                val = float(data['retry_max_wait_seconds'])
+                current['retry_max_wait_seconds'] = max(1.0, min(600.0, val))
+            except (ValueError, TypeError):
+                pass
+
+        if 'download_segments' in data:
+            try:
+                val = int(data['download_segments'])
+                current['download_segments'] = max(1, min(16, val))
             except (ValueError, TypeError):
                 pass
 
@@ -4793,167 +5387,184 @@ def check_aria2_available():
     return False
 
 
-def _download_with_aria2(url, dest_path, download_id, headers=None):
-    """Download using aria2c with resume support"""
-    global active_download_count
+def _aria2_attempt(url, dest_path, download_id, headers, aria2_path):
+    """Run one aria2c transfer into `<dest>.partial`. Returns (ok, error, retryable)."""
+    partial_path = dest_path + '.partial'
+    dest_dir = os.path.dirname(dest_path) or '.'
+    os.makedirs(dest_dir, exist_ok=True)
 
+    cmd = [
+        aria2_path,
+        '--dir=' + dest_dir,
+        '--out=' + os.path.basename(partial_path),
+        '--continue=true',                  # Resume from the partial file
+        '--auto-file-renaming=false',
+        '--allow-overwrite=true',
+        '--max-tries=3',
+        '--retry-wait=5',
+        '--timeout=60',
+        '--connect-timeout=30',
+        '--max-connection-per-server=4',
+        '--split=4',
+        '--min-split-size=1M',
+        '--file-allocation=none',
+        '--console-log-level=error',
+        '--summary-interval=1',
+        url
+    ]
+
+    if headers:
+        for key, value in headers.items():
+            cmd.append(f'--header={key}: {value}')
+
+    _set_progress(download_id, status='downloading', method='aria2')
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+
+    while True:
+        if download_id in cancelled_downloads:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
+            return False, 'Cancelled', False
+
+        if _is_paused(download_id):
+            # Stop the process; --continue picks up from the partial on resume.
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                process.kill()
+            try:
+                if os.path.exists(partial_path):
+                    _set_progress(download_id, downloaded=os.path.getsize(partial_path))
+            except OSError:
+                pass
+            return False, 'Paused', False
+
+        if process.poll() is not None:
+            break
+
+        time.sleep(0.5)
+        try:
+            if os.path.exists(partial_path):
+                current_size = os.path.getsize(partial_path)
+                _set_progress(download_id, downloaded=current_size)
+                total = download_progress.get(download_id, {}).get('total_size', 0)
+                if total > 0:
+                    _set_progress(download_id, progress=min(99, int(current_size * 100 / total)))
+        except Exception:
+            pass
+
+    stderr = ''
+    try:
+        stderr = (process.stderr.read() or '').strip() if process.stderr else ''
+    except Exception:
+        pass
+
+    if process.returncode != 0:
+        retryable = process.returncode not in (3, 8)  # 3/8 = resource not found
+        return False, stderr or f'aria2c exited with code {process.returncode}', retryable
+
+    if not os.path.exists(partial_path):
+        return False, 'aria2c reported success but no output file was produced', True
+
+    os.replace(partial_path, dest_path)
+    return True, None, False
+
+
+def _download_with_aria2(url, dest_path, download_id, headers=None):
+    """Download using aria2c, with resume and exponential-backoff retry."""
     try:
         aria2_path = shutil.which('aria2c')
         if not aria2_path:
             return False, "aria2c not found"
 
-        dest_dir = os.path.dirname(dest_path)
-        dest_file = os.path.basename(dest_path)
+        max_retries, max_delay = _get_retry_config()
+        total_attempts = max_retries + 1
+        display_name = os.path.basename(dest_path)
+        last_error = 'Unknown error'
 
-        cmd = [
-            aria2_path,
-            '--dir=' + dest_dir,
-            '--out=' + dest_file,
-            '--continue=true',           # Resume support
-            '--max-connection-per-server=4',
-            '--split=4',
-            '--min-split-size=1M',
-            '--file-allocation=none',
-            '--console-log-level=error',
-            '--summary-interval=1',
-            url
-        ]
-
-        if headers:
-            for key, value in headers.items():
-                cmd.append(f'--header={key}: {value}')
-
-        with download_lock:
-            download_progress[download_id]['status'] = 'downloading'
-            download_progress[download_id]['method'] = 'aria2'
-
-        # Run aria2c process
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-
-        # Monitor process
-        while True:
-            # Check for cancellation
+        attempt = 0
+        while attempt < total_attempts:
+            attempt += 1
             if download_id in cancelled_downloads:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except Exception:
-                    process.kill()
-                return False, "Cancelled"
+                return False, 'Cancelled'
+            if _wait_while_paused(download_id):
+                return False, 'Cancelled'
 
-            # Check if process completed
-            poll = process.poll()
-            if poll is not None:
+            try:
+                ok, error, retryable = _aria2_attempt(url, dest_path, download_id, headers, aria2_path)
+            except Exception as e:
+                ok, error, retryable = False, str(e), True
+
+            if ok:
+                _set_progress(download_id, status='completed', progress=100, retry_in=0)
+                return True, None
+
+            if error == 'Cancelled':
+                return False, 'Cancelled'
+
+            if error == 'Paused':
+                # The process was stopped mid-transfer; --continue resumes from
+                # the partial file when the download is unpaused.
+                if _wait_while_paused(download_id):
+                    return False, 'Cancelled'
+                attempt -= 1
+                continue
+
+            last_error = error
+
+            if not retryable:
+                logging.error(f"[WMD] {display_name}: aria2 download failed and will not be retried: {error}")
+                return False, error
+
+            if attempt >= total_attempts:
+                last_error = f'{error} -- gave up after {attempt} attempts'
                 break
 
-            # Try to read progress (aria2c outputs progress to stderr)
-            try:
-                time.sleep(0.5)
+            delay = _retry_delay(attempt, max_delay)
+            partial_path = dest_path + '.partial'
+            resume_at = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
+            logging.warning(
+                f"[WMD] {display_name}: aria2 attempt {attempt}/{total_attempts} failed ({error}); "
+                f"retrying in {delay}s" + (f" from byte {resume_at}" if resume_at else "")
+            )
+            _set_progress(download_id, retry_attempt=attempt, retry_max=max_retries,
+                          retry_in=delay, retry_error=error)
 
-                # Check file size for progress
-                if os.path.exists(dest_path):
-                    current_size = os.path.getsize(dest_path)
-                    with download_lock:
-                        download_progress[download_id]['downloaded'] = current_size
-                        total = download_progress[download_id].get('total_size', 0)
-                        if total > 0:
-                            download_progress[download_id]['progress'] = int((current_size / total) * 100)
-            except Exception:
-                pass
+            if _sleep_interruptible(delay, download_id):
+                return False, 'Cancelled'
+            _set_progress(download_id, retry_in=0)
 
-        # Check result
-        if process.returncode == 0:
-            with download_lock:
-                download_progress[download_id]['status'] = 'completed'
-                download_progress[download_id]['progress'] = 100
-            return True, None
-        else:
-            stderr = process.stderr.read() if process.stderr else 'Unknown error'
-            return False, stderr
+        logging.error(f"[WMD] {display_name}: giving up after backoff retries: {last_error}")
+        return False, last_error
 
     except Exception as e:
+        logging.error(f"[WMD] aria2 download error: {e}", exc_info=True)
         return False, str(e)
-    finally:
-        with download_queue_lock:
-            active_download_count = max(0, active_download_count - 1)
 
 
 def _download_native_with_resume(url, dest_path, download_id, headers=None):
-    """Download using requests with resume support (.partial file tracking)"""
-    global active_download_count
+    """Queued download: shared resumable core with retry/backoff.
 
-    partial_path = dest_path + '.partial'
-    resume_byte = 0
-
-    # Check for existing partial download
-    if os.path.exists(partial_path):
-        resume_byte = os.path.getsize(partial_path)
-        logging.info(f"[WMD] Resuming download from byte {resume_byte}")
-
-    req_headers = headers.copy() if headers else {}
-    if resume_byte > 0:
-        req_headers['Range'] = f'bytes={resume_byte}-'
-
-    try:
-        response = requests.get(url, stream=True, timeout=30, allow_redirects=True, headers=req_headers)
-
-        # Check if server supports resume
-        if resume_byte > 0 and response.status_code != 206:
-            # Server doesn't support resume, start from beginning
-            resume_byte = 0
-            response = requests.get(url, stream=True, timeout=30, allow_redirects=True, headers=headers or {})
-
-        response.raise_for_status()
-
-        total_size = int(response.headers.get('content-length', 0))
-        if resume_byte > 0:
-            total_size += resume_byte  # Add already downloaded bytes
-
-        with download_lock:
-            download_progress[download_id]['total_size'] = total_size
-            download_progress[download_id]['status'] = 'downloading'
-            download_progress[download_id]['method'] = 'native_resume'
-
-        # Open file in append mode if resuming
-        mode = 'ab' if resume_byte > 0 else 'wb'
-        downloaded = resume_byte
-
-        with open(partial_path, mode) as f:
-            for chunk in response.iter_content(chunk_size=1024*1024):  # 1MB chunks for faster downloads
-                # Check for cancellation
-                if download_id in cancelled_downloads:
-                    return False, "Cancelled"
-
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    with download_lock:
-                        download_progress[download_id]['downloaded'] = downloaded
-                        if total_size > 0:
-                            download_progress[download_id]['progress'] = int((downloaded / total_size) * 100)
-
-        # Rename partial to final
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        os.rename(partial_path, dest_path)
-
-        with download_lock:
-            download_progress[download_id]['status'] = 'completed'
-            download_progress[download_id]['progress'] = 100
-
-        return True, None
-
-    except Exception as e:
-        # Keep partial file for resume
-        return False, str(e)
-    finally:
-        with download_queue_lock:
-            active_download_count = max(0, active_download_count - 1)
+    Shares `_download_with_resume` with the direct/HF paths so a dropped
+    connection resumes from the partial file instead of failing the job.
+    The queue worker owns the active-download counter, so nothing is
+    decremented here.
+    """
+    _set_progress(download_id, status='downloading', method='native_resume')
+    return _download_with_resume(
+        url, dest_path, download_id, headers,
+        display_name=os.path.basename(dest_path)
+    )
 
 
 # ============================================================================
@@ -5036,7 +5647,7 @@ def _process_queued_download(download_info):
         else:
             success, error = _download_native_with_resume(url, dest_path, download_id, headers)
 
-        if not success and error != "Cancelled":
+        if not success and error not in ("Cancelled", "Paused"):
             with download_lock:
                 download_progress[download_id]['status'] = 'error'
                 download_progress[download_id]['error'] = error
@@ -5048,6 +5659,11 @@ def _process_queued_download(download_info):
                 'error': error,
                 'directory': os.path.dirname(dest_path)
             })
+        elif not success and error == "Paused":
+            # Keep the queue entry so /resume can schedule this download again;
+            # the partial file means it continues instead of restarting.
+            paused_download_info[download_id] = download_info
+            _mark_download_paused(download_id, filename)
 
         # Cache URL on success
         if success:

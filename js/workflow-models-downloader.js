@@ -255,6 +255,34 @@ const styles = `
     color: white;
 }
 
+.wmd-pause-btn {
+    background: none;
+    border: 1px solid #666;
+    color: #999;
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.wmd-pause-btn:hover {
+    background-color: #ff9800;
+    border-color: #ff9800;
+    color: white;
+}
+
+.wmd-pause-btn.paused {
+    border-color: #4CAF50;
+    color: #4CAF50;
+}
+
 .wmd-btn-info {
     background-color: #2196F3;
     color: white;
@@ -1998,8 +2026,8 @@ class WorkflowModelsDownloader {
                                            downloadId.endsWith(`_${modelFilename}`);
 
                     if (matchesFilename) {
-                        if (progress.status === 'downloading' || progress.status === 'starting' || progress.status === 'queued') {
-                            // Found an active download for this model
+                        if (progress.status === 'downloading' || progress.status === 'starting' || progress.status === 'queued' || progress.status === 'paused') {
+                            // Found an active (possibly paused) download for this model
                             this.downloads[i] = downloadId;
                             hasActiveDownloads = true;
 
@@ -2385,6 +2413,11 @@ class WorkflowModelsDownloader {
                                 <div class="wmd-progress-bar" style="flex: 1;">
                                     <div class="wmd-progress-fill" id="wmd-progress-fill-${index}" style="width: 0%"></div>
                                 </div>
+                                <button class="wmd-pause-btn" id="wmd-pause-${index}"
+                                        onclick="window.wmdInstance.togglePause(${index})"
+                                        title="Pause download">
+                                    \u2016
+                                </button>
                                 <button class="wmd-cancel-btn" id="wmd-cancel-${index}"
                                         onclick="window.wmdInstance.cancelDownload(${index})"
                                         title="Cancel download">
@@ -2443,6 +2476,11 @@ class WorkflowModelsDownloader {
                                 <div class="wmd-progress-bar" style="flex: 1;">
                                     <div class="wmd-progress-fill" id="wmd-progress-fill-${index}" style="width: 0%"></div>
                                 </div>
+                                <button class="wmd-pause-btn" id="wmd-pause-${index}"
+                                        onclick="window.wmdInstance.togglePause(${index})"
+                                        title="Pause download">
+                                    \u2016
+                                </button>
                                 <button class="wmd-cancel-btn" id="wmd-cancel-${index}"
                                         onclick="window.wmdInstance.cancelDownload(${index})"
                                         title="Cancel download">
@@ -2897,6 +2935,46 @@ class WorkflowModelsDownloader {
         }
     }
 
+    async togglePause(index) {
+        // Pause keeps the partial file and lets the transfer resume from its
+        // current byte offset; cancel throws that progress away.
+        const model = this.models[index];
+        const downloadId = this.downloads[index];
+        if (!model || !downloadId) return;
+
+        const btn = document.getElementById(`wmd-pause-${index}`);
+        const isPaused = btn && btn.classList.contains("paused");
+        const action = isPaused ? "resume" : "pause";
+
+        if (btn) btn.disabled = true;
+        try {
+            const response = await api.fetchApi(
+                `/workflow-models/${action}/${encodeURIComponent(downloadId)}`,
+                { method: "POST" }
+            );
+            const result = await response.json();
+
+            if (result.success) {
+                if (btn) {
+                    btn.classList.toggle("paused", !isPaused);
+                    btn.textContent = isPaused ? "\u2016" : "\u25B6";
+                    btn.title = isPaused ? "Pause download" : "Resume download";
+                }
+                this.updateDownloadStatus(
+                    index,
+                    isPaused ? "downloading" : "paused",
+                    isPaused ? "Resuming..." : "Paused"
+                );
+            } else if (result.error) {
+                console.warn("[WMD] Pause/resume rejected:", result.error);
+            }
+        } catch (error) {
+            console.error("[WMD] Pause/resume error:", error);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
     async cancelDownload(index) {
         const model = this.models[index];
         const downloadId = this.downloads[index];
@@ -2994,6 +3072,11 @@ class WorkflowModelsDownloader {
                         <div class="wmd-progress-bar" style="flex: 1;">
                             <div class="wmd-progress-fill" id="wmd-progress-fill-${index}" style="width: 0%"></div>
                         </div>
+                        <button class="wmd-pause-btn" id="wmd-pause-${index}"
+                                onclick="window.wmdInstance.togglePause(${index})"
+                                title="Pause download">
+                            \u2016
+                        </button>
                         <button class="wmd-cancel-btn" id="wmd-cancel-${index}"
                                 onclick="window.wmdInstance.cancelDownload(${index})"
                                 title="Cancel download">
@@ -3435,9 +3518,16 @@ class WorkflowModelsDownloader {
         const dlBtn = document.getElementById(`wmd-dl-btn-${index}`);
         const statusCell = document.getElementById(`wmd-status-cell-${index}`);
         const cancelBtn = document.getElementById(`wmd-cancel-${index}`);
+        const pauseBtn = document.getElementById(`wmd-pause-${index}`);
 
         if (progressFill) {
             progressFill.style.width = `${progress.progress || 0}%`;
+        }
+
+        // Pausing only makes sense while bytes are still moving.
+        if (pauseBtn) {
+            const active = ["downloading", "starting", "queued", "paused"].includes(progress.status);
+            pauseBtn.style.display = active ? "flex" : "none";
         }
 
         if (statusDiv) {
@@ -3468,7 +3558,11 @@ class WorkflowModelsDownloader {
                 this.updateSummary();
 
             } else if (progress.status === "error") {
-                statusDiv.textContent = `Error: ${progress.error}`;
+                // Partial data is kept, so retrying resumes instead of restarting
+                const kept = progress.downloaded
+                    ? ` — ${this.formatSize(progress.downloaded)} kept for resume`
+                    : "";
+                statusDiv.textContent = `Error: ${progress.error}${kept}`;
                 statusDiv.style.color = "#f44336";
                 // Hide cancel button on error
                 if (cancelBtn) cancelBtn.style.display = "none";
@@ -3483,7 +3577,31 @@ class WorkflowModelsDownloader {
             } else if (progress.status === "downloading") {
                 const downloaded = this.formatSize(progress.downloaded || 0);
                 const total = this.formatSize(progress.total_size || 0);
-                statusDiv.textContent = `${downloaded} / ${total} (${progress.progress || 0}%)`;
+                const resumed = progress.resuming_from
+                    ? `, resumed at ${this.formatSize(progress.resuming_from)}`
+                    : "";
+                if (progress.retry_in > 0) {
+                    // Waiting out the backoff delay before the next attempt
+                    statusDiv.textContent =
+                        `${downloaded} / ${total} (${progress.progress || 0}%) — ` +
+                        `connection lost, retry ${progress.retry_attempt}/${progress.retry_max} in ${Math.ceil(progress.retry_in)}s`;
+                    statusDiv.style.color = "#ff9800";
+                } else {
+                    statusDiv.textContent = `${downloaded} / ${total} (${progress.progress || 0}%)${resumed}`;
+                    statusDiv.style.color = "";
+                }
+
+            } else if (progress.status === "paused") {
+                const downloaded = this.formatSize(progress.downloaded || 0);
+                const total = this.formatSize(progress.total_size || 0);
+                statusDiv.textContent =
+                    `Paused at ${downloaded} / ${total} (${progress.progress || 0}%) — press play to resume`;
+                statusDiv.style.color = "#ff9800";
+                if (pauseBtn) {
+                    pauseBtn.classList.add("paused");
+                    pauseBtn.textContent = "\u25B6";
+                    pauseBtn.title = "Resume download";
+                }
 
             } else {
                 statusDiv.textContent = progress.status || "Starting...";
@@ -3560,7 +3678,7 @@ class WorkflowModelsDownloader {
             const activeFilenames = new Set();
 
             for (const [id, progress] of Object.entries(allProgress)) {
-                if (progress.status === 'downloading' || progress.status === 'starting') {
+                if (progress.status === 'downloading' || progress.status === 'starting' || progress.status === 'paused') {
                     active.push({ id, ...progress });
                     activeFilenames.add(progress.filename);
                 }
@@ -4419,7 +4537,7 @@ class WorkflowModelsDownloader {
                     </div>
                 </div>
                 <div style="display: flex; align-items: center; gap: 8px;">
-                    <a href="${versionInfo.github_url || 'https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader'}" target="_blank" class="wmd-btn wmd-btn-secondary wmd-btn-small" title="View on GitHub">
+                    <a href="${versionInfo.github_url || 'https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader'}" target="_blank" class="wmd-btn wmd-btn-secondary wmd-btn-small" title="View on GitHub">
                         GitHub
                     </a>
                     ${updateButton}
@@ -4484,7 +4602,7 @@ class WorkflowModelsDownloader {
                     </ol>
                     <div class="wmd-help-warning">
                         <strong>Alternative:</strong> You can also install manually by cloning the repository:<br>
-                        <code>git clone https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader</code><br>
+                        <code>git clone https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader</code><br>
                         into your <code>ComfyUI/custom_nodes/</code> folder.
                     </div>
                 </div>
@@ -5288,7 +5406,7 @@ function startBackgroundPolling() {
             let completedDownloads = [];
 
             for (const [downloadId, progress] of Object.entries(allProgress)) {
-                if (progress.status === 'downloading' || progress.status === 'starting') {
+                if (progress.status === 'downloading' || progress.status === 'starting' || progress.status === 'paused') {
                     hasActiveDownloads = true;
                     backgroundDownloads[downloadId] = progress;
                 } else if (progress.status === 'completed' && backgroundDownloads[downloadId]) {

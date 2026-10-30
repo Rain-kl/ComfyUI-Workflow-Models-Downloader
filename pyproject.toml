@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-workflow-models-downloader"
-description = "Scan workflows for required models and download them automatically from HuggingFace, CivitAI, and other sources. Features include filter dropdowns, Tavily AI-powered advanced search, metadata caching, and automatic URL restoration."
-version = "1.8.1"
+description = "Scan workflows for required models and download them automatically from HuggingFace, CivitAI, and other sources. Features include segmented multi-connection downloads with resume and automatic retry, pause/resume, filter dropdowns, Tavily AI-powered advanced search, metadata caching, and automatic URL restoration."
+version = "1.9.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,11 +13,11 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader"
-Documentation = "https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader#readme"
-"Bug Tracker" = "https://github.com/slahiri/ComfyUI-Workflow-Models-Downloader/issues"
+Repository = "https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader"
+Documentation = "https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader#readme"
+"Bug Tracker" = "https://github.com/Rain-kl/ComfyUI-Workflow-Models-Downloader/issues"
 
 [tool.comfy]
 PublisherId = "slahiri"
 DisplayName = "Workflow Models Downloader"
-Icon = "https://raw.githubusercontent.com/slahiri/ComfyUI-Workflow-Models-Downloader/main/images/workflow-models-tab.png"
+Icon = "https://raw.githubusercontent.com/Rain-kl/ComfyUI-Workflow-Models-Downloader/main/images/workflow-models-tab.png"
