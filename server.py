@@ -73,7 +73,7 @@ def get_installed_version():
         logging.debug(f"[WMD] Looking for pyproject.toml at: {PYPROJECT_FILE}")
         if not os.path.exists(PYPROJECT_FILE):
             logging.warning(f"[WMD] pyproject.toml not found at: {PYPROJECT_FILE}")
-            return "1.9.0"  # Fallback to current version
+            return "1.8.1"  # Fallback to current version
 
         with open(PYPROJECT_FILE, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -87,7 +87,7 @@ def get_installed_version():
                 logging.warning(f"[WMD] Could not find version in pyproject.toml")
     except Exception as e:
         logging.error(f"[WMD] Could not read version from pyproject.toml: {e}")
-    return "1.9.0"  # Fallback to current version
+    return "1.8.1"  # Fallback to current version
 
 def get_latest_version():
     """Get latest version from GitHub releases API"""
@@ -3285,119 +3285,172 @@ def _save_segment_state(state_path, state):
         logging.debug(f"[WMD] Could not persist segment state: {exc}")
 
 
+def _claim_tail(segment, state, lock):
+    """Split an unfinished segment so an idle worker can take its tail half.
+
+    Without this, a single slow connection drives the last straggler segment
+    while every other connection sits idle. The split is persisted so both
+    halves stay resumable. Returns the tail range to download, or None.
+    Caller must hold `lock`.
+    """
+    current = segment['start'] + segment.get('done', 0)
+    end = segment['end']
+    remaining = end - current + 1
+    if remaining < 2 * DOWNLOAD_SEGMENT_MIN_SIZE:
+        return None  # Too small to be worth splitting again
+
+    split_at = current + remaining // 2
+    # Shrink the original segment to the head half and claim the tail.
+    segment['end'] = split_at - 1
+    state['segments'].append({'start': split_at, 'end': end, 'done': 0})
+    return {'start': split_at, 'end': end, 'done': 0}
+
+
 def _segment_worker(url, fd, segment, headers, download_id, counters, error_box, state, state_path, lock):
     """Download one byte range, persisting progress and retrying individually.
 
     Writes land at their absolute offset via pwrite, so segments never share a
-    file cursor and an interrupted run can be resumed byte-for-byte.
+    file cursor and an interrupted run can be resumed byte-for-byte. When this
+    worker finishes its range it steals the tail of any still-running segment
+    instead of exiting, so bandwidth is not left idle near the end.
     """
-    start = segment['start']
-    end = segment['end']
-    position = start + segment.get('done', 0)
+    current = segment
+    start = current['start']
+    end = current['end']
+    position = start + current.get('done', 0)
 
     attempts_used = 0
-    while position <= end:
-        if download_id in cancelled_downloads:
-            return
-        if _wait_while_paused(download_id):
-            return
-
-        request_headers = dict(headers) if headers else {}
-        request_headers['Range'] = f'bytes={position}-{end}'
-        before = position
-
-        try:
-            with requests.get(url, headers=request_headers, stream=True, allow_redirects=True,
-                              timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
-                if response.status_code not in (200, 206):
-                    raise requests.exceptions.HTTPError(
-                        _http_error_message(response, url), response=response)
-
-                # A 200 means the server ignored the range; treat the body as
-                # starting at this segment's offset only if it actually is.
-                seek_offset = 0
-                if response.status_code == 206:
-                    content_range = response.headers.get('content-range', '')
-                    match = re.match(r'bytes\s+(\d+)-\d+/', content_range)
-                    if match and int(match.group(1)) != position:
-                        raise ValueError(
-                            f'Server returned range starting at {match.group(1)}, expected {position}')
-                else:
-                    # Whole file from byte 0: skip forward to our offset
-                    seek_offset = position
-
-                skipped = 0
-                snapshot = counters['downloaded']
-                paused = False
-                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                    if download_id in cancelled_downloads:
-                        return
-                    if _is_paused(download_id):
-                        # Drop the connection and re-request from this offset on
-                        # resume; holding the socket open would keep the server
-                        # pushing data we cannot write.
-                        paused = True
-                        break
-                    if not chunk:
-                        continue
-                    if skipped < seek_offset:
-                        to_skip = min(len(chunk), seek_offset - skipped)
-                        skipped += to_skip
-                        chunk = chunk[to_skip:]
-                        if not chunk:
-                            continue
-                    limit = end - position + 1
-                    if len(chunk) > limit:
-                        chunk = chunk[:limit]
-                    _pwrite(fd, chunk, position)
-                    position += len(chunk)
-                    with lock:
-                        counters['downloaded'] += len(chunk)
-                        segment['done'] = position - start
-                        snapshot = counters['downloaded']
-
-                with lock:
-                    _save_segment_state(state_path, state)
-                    _set_progress(download_id, downloaded=snapshot)
-
-                if paused:
-                    continue  # Outer loop waits for the resume signal, then re-ranges
-
-                if position <= end:
-                    raise IOError(f'Segment ended early at {position}, expected through {end}')
-
-                return
-
-        except Exception as exc:
+    while True:
+        while position <= end:
             if download_id in cancelled_downloads:
                 return
+            if _wait_while_paused(download_id):
+                return
 
+            request_headers = dict(headers) if headers else {}
+            request_headers['Range'] = f'bytes={position}-{end}'
+            before = position
+
+            try:
+                with requests.get(url, headers=request_headers, stream=True, allow_redirects=True,
+                                  timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
+                    if response.status_code not in (200, 206):
+                        raise requests.exceptions.HTTPError(
+                            _http_error_message(response, url), response=response)
+
+                    # A 200 means the server ignored the range; treat the body as
+                    # starting at this segment's offset only if it actually is.
+                    seek_offset = 0
+                    if response.status_code == 206:
+                        content_range = response.headers.get('content-range', '')
+                        match = re.match(r'bytes\s+(\d+)-\d+/', content_range)
+                        if match and int(match.group(1)) != position:
+                            raise ValueError(
+                                f'Server returned range starting at {match.group(1)}, expected {position}')
+                    else:
+                        # Whole file from byte 0: skip forward to our offset
+                        seek_offset = position
+
+                    skipped = 0
+                    snapshot = counters['downloaded']
+                    paused = False
+                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                        if download_id in cancelled_downloads:
+                            return
+                        if _is_paused(download_id):
+                            # Drop the connection and re-request from this offset on
+                            # resume; holding the socket open would keep the server
+                            # pushing data we cannot write.
+                            paused = True
+                            break
+                        if not chunk:
+                            continue
+                        if skipped < seek_offset:
+                            to_skip = min(len(chunk), seek_offset - skipped)
+                            skipped += to_skip
+                            chunk = chunk[to_skip:]
+                            if not chunk:
+                                continue
+                        limit = end - position + 1
+                        if len(chunk) > limit:
+                            chunk = chunk[:limit]
+                        _pwrite(fd, chunk, position)
+                        position += len(chunk)
+                        with lock:
+                            counters['downloaded'] += len(chunk)
+                            current['done'] = position - start
+                            snapshot = counters['downloaded']
+
+                    with lock:
+                        _save_segment_state(state_path, state)
+                        _set_progress(download_id, downloaded=snapshot)
+
+                    if paused:
+                        continue  # Outer loop waits for the resume signal, then re-ranges
+
+                    if position <= end:
+                        raise IOError(f'Segment ended early at {position}, expected through {end}')
+
+                    break  # Range complete; try to steal another tail below
+
+            except Exception as exc:
+                if download_id in cancelled_downloads:
+                    return
+
+                with lock:
+                    current['done'] = position - start
+                    _save_segment_state(state_path, state)
+
+                attempts_used += 1
+                max_retries, max_delay = _get_retry_config()
+                if attempts_used > max_retries:
+                    error_box.append(str(exc) or type(exc).__name__)
+                    return
+
+                if position == before and attempts_used > 1:
+                    # Nothing moved: back off so we don't hammer a dead endpoint
+                    delay = _retry_delay(attempts_used, max_delay)
+                else:
+                    delay = _retry_delay(1, max_delay)
+
+                logging.warning(
+                    f"[WMD] segment {start}-{end}: attempt {attempts_used}/{max_retries + 1} "
+                    f"failed ({exc}); retrying in {delay}s from byte {position}"
+                )
+                if _sleep_interruptible(delay, download_id):
+                    return
+
+        if position > end:
             with lock:
-                segment['done'] = position - start
                 _save_segment_state(state_path, state)
 
-            attempts_used += 1
-            max_retries, max_delay = _get_retry_config()
-            if attempts_used > max_retries:
-                error_box.append(str(exc) or type(exc).__name__)
+            # This range is done. Rather than exit and leave the connection
+            # idle, take the tail half of a segment still in flight so the
+            # remaining bytes are fetched over the full connection count.
+            if download_id in cancelled_downloads:
+                return
+            stolen = None
+            with lock:
+                for candidate in sorted(state['segments'],
+                                        key=lambda s: (s['end'] - s['start']),
+                                        reverse=True):
+                    if candidate is current:
+                        continue
+                    if candidate['start'] + candidate.get('done', 0) > candidate['end']:
+                        continue
+                    stolen = _claim_tail(candidate, state, lock)
+                    if stolen:
+                        _save_segment_state(state_path, state)
+                        break
+            if not stolen:
                 return
 
-            if position == before and attempts_used > 1:
-                # Nothing moved: back off so we don't hammer a dead endpoint
-                delay = _retry_delay(attempts_used, max_delay)
-            else:
-                delay = _retry_delay(1, max_delay)
-
-            logging.warning(
-                f"[WMD] segment {start}-{end}: attempt {attempts_used}/{max_retries + 1} "
-                f"failed ({exc}); retrying in {delay}s from byte {position}"
-            )
-            if _sleep_interruptible(delay, download_id):
-                return
-
-    if position > end:
-        with lock:
-            _save_segment_state(state_path, state)
+            current = stolen
+            start = current['start']
+            end = current['end']
+            position = start
+            attempts_used = 0
+            logging.debug(f"[WMD] stolen tail range {start}-{end}")
 
 
 def _download_segmented(url, dest_path, download_id, headers, total_size, force=False):
