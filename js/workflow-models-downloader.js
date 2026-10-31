@@ -3697,22 +3697,32 @@ class WorkflowModelsDownloader {
 
             const hasHistory = completed.length > 0 || failed.length > 0;
 
-            content.innerHTML = `
-                <!-- Raw Download Section -->
-                <div class="wmd-raw-download-section">
-                    <div class="wmd-downloads-section-title">Direct URL Download</div>
-                    <div class="wmd-raw-download-input-row">
-                        <input type="text" class="wmd-url-input" id="wmd-raw-url-input"
-                               placeholder="Paste URL (HuggingFace, CivitAI) or CivitAI URN (urn:air:...)..."
-                               style="flex: 1;"
-                               onkeypress="if(event.key==='Enter') window.wmdInstance.analyzeRawUrl()">
-                        <button class="wmd-btn wmd-btn-info wmd-btn-small" onclick="window.wmdInstance.analyzeRawUrl()">
-                            Check URL
-                        </button>
+            // The panel shell (URL box and toolbar) is built once and then left
+            // alone. Re-rendering it on every refresh destroyed the input
+            // element, wiping whatever the user had typed and losing focus.
+            let data = document.getElementById("wmd-downloads-data");
+            if (!data || !content.querySelector("#wmd-downloads-data")) {
+                content.innerHTML = `
+                    <!-- Raw Download Section -->
+                    <div class="wmd-raw-download-section">
+                        <div class="wmd-downloads-section-title">Direct URL Download</div>
+                        <div class="wmd-raw-download-input-row">
+                            <input type="text" class="wmd-url-input" id="wmd-raw-url-input"
+                                   placeholder="Paste URL (HuggingFace, CivitAI) or CivitAI URN (urn:air:...)..."
+                                   style="flex: 1;"
+                                   onkeypress="if(event.key==='Enter') window.wmdInstance.analyzeRawUrl()">
+                            <button class="wmd-btn wmd-btn-info wmd-btn-small" onclick="window.wmdInstance.analyzeRawUrl()">
+                                Check URL
+                            </button>
+                        </div>
+                        <div id="wmd-raw-download-preview" style="display: none;"></div>
                     </div>
-                    <div id="wmd-raw-download-preview" style="display: none;"></div>
-                </div>
+                    <div id="wmd-downloads-data"></div>
+                `;
+                data = document.getElementById("wmd-downloads-data");
+            }
 
+            data.innerHTML = `
                 <div class="wmd-downloads-header">
                     <div class="wmd-downloads-stats">
                         <div class="wmd-downloads-stat">
@@ -3843,9 +3853,17 @@ class WorkflowModelsDownloader {
             const activeSize = download.total_size > 0
                 ? `${this.formatBytes(download.downloaded || 0)} / ${this.formatBytes(download.total_size)}`
                 : 'Calculating...';
-            statusBadge = `<span style="color: #2196F3;">Downloading... ${progressPercent}%</span>`;
-            actionBtn = `<button class="wmd-btn wmd-btn-danger wmd-btn-small"
-                                 onclick="window.wmdInstance.cancelDownloadById('${download.id}')">Cancel</button>`;
+            const isPaused = download.status === 'paused';
+            statusBadge = isPaused
+                ? `<span style="color: #ff9800;">Paused at ${progressPercent}%</span>`
+                : `<span style="color: #2196F3;">Downloading... ${progressPercent}%</span>`;
+            actionBtn = `
+                <button class="wmd-btn wmd-btn-secondary wmd-btn-small" style="padding: 4px 8px; font-size: 11px;"
+                        onclick="window.wmdInstance.togglePauseById('${download.id}')">
+                    ${isPaused ? 'Resume' : 'Pause'}
+                </button>
+                <button class="wmd-btn wmd-btn-danger wmd-btn-small"
+                        onclick="window.wmdInstance.cancelDownloadById('${download.id}')">Cancel</button>`;
             return `
                 <div class="wmd-download-item">
                     <div class="wmd-download-item-info">
@@ -3910,6 +3928,33 @@ class WorkflowModelsDownloader {
             }
         } catch (error) {
             console.error("[WMD] Error deleting history item:", error);
+        }
+    }
+
+    async togglePauseById(downloadId) {
+        // Pause keeps the partial file so resuming continues from the current
+        // byte offset; cancel would discard that progress.
+        try {
+            const progressResponse = await api.fetchApi("/workflow-models/progress");
+            const allProgress = progressResponse.ok ? await progressResponse.json() : {};
+            const entry = allProgress[downloadId];
+            const action = entry && entry.status === 'paused' ? 'resume' : 'pause';
+
+            const response = await api.fetchApi(
+                `/workflow-models/${action}/${encodeURIComponent(downloadId)}`,
+                { method: 'POST' }
+            );
+            const result = await response.json();
+
+            if (result.success) {
+                this.showNotification(action === 'pause' ? 'Download paused' : 'Download resumed', 'info');
+            } else {
+                this.showNotification(result.error || `Could not ${action} download`, 'error');
+            }
+            this.loadDownloadsTab();
+        } catch (error) {
+            console.error("[WMD] Error pausing/resuming download:", error);
+            this.showNotification('Error pausing/resuming download', 'error');
         }
     }
 
