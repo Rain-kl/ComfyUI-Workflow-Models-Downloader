@@ -5720,6 +5720,9 @@ def _process_queued_download(download_info):
 
         # Cache URL on success
         if success:
+            # The download itself is finished, so the progress entry has to
+            # leave the 'downloading' state or the UI shows it forever.
+            _set_progress(download_id, status='completed', progress=100, retry_in=0, error='')
             source = 'civitai' if 'civitai.com' in url else ('huggingface' if 'huggingface.co' in url else 'direct')
             hf_repo, hf_path = extract_huggingface_info(url)
             _cache_download_url(filename, url, source, hf_repo=hf_repo, hf_path=hf_path)
