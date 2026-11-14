@@ -3852,11 +3852,18 @@ class WorkflowModelsDownloader {
         if (status === 'active') {
             const activeSize = download.total_size > 0
                 ? `${this.formatBytes(download.downloaded || 0)} / ${this.formatBytes(download.total_size)}`
-                : 'Calculating...';
+                : (download.downloaded > 0 ? `${this.formatBytes(download.downloaded)} / ?` : 'Calculating...');
             const isPaused = download.status === 'paused';
-            statusBadge = isPaused
-                ? `<span style="color: #ff9800;">Paused at ${progressPercent}%</span>`
-                : `<span style="color: #2196F3;">Downloading... ${progressPercent}%</span>`;
+            let statusBadge;
+            if (isPaused) {
+                statusBadge = `<span style="color: #ff9800;">Paused at ${progressPercent}%</span>`;
+            } else if (download.retry_in > 0) {
+                const attemptInfo = download.retry_attempt ? ` (${download.retry_attempt}/${download.retry_max || '?'})` : '';
+                const errHint = download.retry_error ? ` — ${download.retry_error}` : '';
+                statusBadge = `<span style="color: #ff9800;">Retrying${attemptInfo} in ${Math.ceil(download.retry_in)}s${errHint}</span>`;
+            } else {
+                statusBadge = `<span style="color: #2196F3;">Downloading... ${progressPercent}%</span>`;
+            }
             actionBtn = `
                 <button class="wmd-btn wmd-btn-secondary wmd-btn-small" style="padding: 4px 8px; font-size: 11px;"
                         onclick="window.wmdInstance.togglePauseById('${download.id}')">

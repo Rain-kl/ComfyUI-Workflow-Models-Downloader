@@ -5508,12 +5508,45 @@ def _aria2_attempt(url, dest_path, download_id, headers, aria2_path):
 
     _set_progress(download_id, status='downloading', method='aria2')
 
+    # Probe total size upfront so the UI shows real progress instead of
+    # "Calculating... 0%", and finalize immediately if .partial is already complete.
+    total_size = download_progress.get(download_id, {}).get('total_size', 0)
+    if total_size <= 0:
+        total_size = _probe_segment_support(url, headers)
+        if total_size > 0:
+            _set_progress(download_id, total_size=total_size)
+
+    if (
+        total_size > 0
+        and os.path.exists(partial_path)
+        and not os.path.exists(partial_path + '.aria2')
+        and os.path.getsize(partial_path) == total_size
+    ):
+        os.replace(partial_path, dest_path)
+        _set_progress(download_id, downloaded=total_size, progress=100)
+        return True, None, False
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         universal_newlines=True
     )
+
+    from collections import deque
+    output_lines = deque(maxlen=25)
+
+    def _drain_output():
+        try:
+            for line in process.stdout:
+                stripped = line.strip()
+                if stripped:
+                    output_lines.append(stripped)
+        except Exception:
+            pass
+
+    reader_thread = threading.Thread(target=_drain_output, daemon=True)
+    reader_thread.start()
 
     while True:
         if download_id in cancelled_downloads:
@@ -5552,15 +5585,12 @@ def _aria2_attempt(url, dest_path, download_id, headers, aria2_path):
         except Exception:
             pass
 
-    stderr = ''
-    try:
-        stderr = (process.stderr.read() or '').strip() if process.stderr else ''
-    except Exception:
-        pass
+    reader_thread.join(timeout=2)
+    error_output = ' | '.join(list(output_lines)[-3:])
 
     if process.returncode != 0:
-        retryable = process.returncode not in (3, 8)  # 3/8 = resource not found
-        return False, stderr or f'aria2c exited with code {process.returncode}', retryable
+        retryable = process.returncode not in (3, 8, 24)  # 3/8 = not found, 24 = HTTP auth failed
+        return False, error_output or f'aria2c exited with code {process.returncode}', retryable
 
     if not os.path.exists(partial_path):
         return False, 'aria2c reported success but no output file was produced', True
